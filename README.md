@@ -2,6 +2,8 @@
 
 Federal Audit Clearinghouse MCP — US single-audit filings (Uniform Guidance, formerly OMB A-133): who spends federal grant money, under which Assistance Listing program, and what the auditors found. api.data.gov key.
 
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1394+ live data sources.
+
 ## Tools
 
 - `fac_search_audits(auditee_name|uei|ein|state|audit_year|min_total_expended, ...)` — find audits; returns report_id, organization identity, total federal awards expended, oversight agency, FAC acceptance date.
@@ -42,7 +44,7 @@ Add to your MCP client (Claude Desktop, Cursor, Windsurf, etc.):
 }
 ```
 
-Or connect to the full Pipeworx gateway for access to all 1375+ data sources:
+Or connect to the full Pipeworx gateway for access to all 1394+ data sources:
 
 ```json
 {
@@ -66,7 +68,7 @@ The gateway picks the right tool and fills the arguments automatically.
 
 ## More
 
-- [All tools and guides](https://github.com/pipeworx-io/examples)
+- [Docs and guides](https://pipeworx.io/docs)
 - [pipeworx.io](https://pipeworx.io)
 
 ## License
