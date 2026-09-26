@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-fac",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Federal Audit Clearinghouse (FAC) MCP — US single-audit data.",
   "type": "module",
   "main": "src/index.ts",
@@ -26,7 +26,7 @@
     "@cloudflare/workers-types": "^4.20260405.1"
   },
   "pipeworx": {
-    "sourceHash": "v1-5085420611dcc1c725641e054dd7b07d6ecd2a1a8f06f6d983b1f9e1ee2cc3a0",
-    "sourceCommit": "76aa8f5d9b5dc2f665563030647c68e661478864"
+    "sourceHash": "v1-5f2f577271d8b91b09b051af31b1ae877da8adff80e81c3338db274938218eed",
+    "sourceCommit": "91681e9a4a137fa0051d58e32f38c64b6334af5c"
   }
 }
