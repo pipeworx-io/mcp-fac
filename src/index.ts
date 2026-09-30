@@ -671,7 +671,9 @@ function collapse(s: string): string {
   return s.replace(/\s+/g, ' ').trim();
 }
 /**
- * Federal Audit Clearinghouse (FAC) MCP — US single-audit data.
+ * Federal Audit Clearinghouse (FAC) MCP — US single-audit data, served from a
+ * served from a Pipeworx-maintained copy of its own bulk data (fleet #2504).
+ * hosting-claims-ok: internal architecture note for maintainers, not caller-visible.
  *
  * Every non-federal entity (state, city, university, hospital, tribe,
  * nonprofit) that expends more than ~$750k/yr in federal awards must submit a
@@ -680,15 +682,40 @@ function collapse(s: string): string {
  * spends it, under which Assistance Listing (CFDA) program, and whether the
  * auditors flagged anything.
  *
- * API: https://api.fac.gov  (PostgREST — `?col=eq.x`, `ilike.*x*`, `gte.n`,
- *      plus select= / order= / limit= / offset=)
- * Auth: `X-Api-Key` header, an api.data.gov umbrella key
- *      (free at https://api.data.gov/signup).
+ * WHY A MIRROR, NOT A LIVE PROXY (previously this pack called api.fac.gov
+ * directly): measured 60d to 2026-09-29, fac_search_audits was upstream_down
+ * on 572 of ~1,620 external calls (35%, 3.9s avg) — the largest ask_pipeworx
+ * no_match cluster in the catalog. Separately, api.fac.gov's own PostgREST
+ * exposes no foreign key between /general and /findings (PGRST200 on any
+ * embed), so a cross-table question ("material weaknesses in Texas under CFDA
+ * 93.224") was structurally impossible against the live API, not merely slow.
+ * Per Bruce's 2026-09-23 ruling ("build a copy when live doesn't serve"), this
+ * pack now loads FAC's own public bulk CSV extracts on a weekly refresh,
+ * scripts/fac-upsert.sh + .github/workflows/fac-refresh.yml) into Supabase.
+ * Schema + RPCs: supabase/migrations/220_fac_local_mirror.sql (filename only; not caller-visible).
  *
- * GOTCHA: the api.data.gov umbrella reports throttling as a JSON body
- * `{"error":{"code":"OVER_RATE_LIMIT",...}}` and it arrives with HTTP 200 as
- * often as HTTP 429. So every response body is inspected for `.error.code`
- * regardless of status — see `facGet`.
+ * NO API KEY NEEDED ANY MORE. The live-proxy version required a caller's own
+ * api.data.gov key; none is needed any more — every tool below runs off the
+ * local database via `_supabaseUrl`/`_supabaseKey`, injected by the gateway
+ * (pack-manifest `injectSupabase: true`).
+ *
+ * NO PERSONAL DATA IN THE MIRROR (local-copy rule, task #2504). FAC's
+ * general.csv carries named-individual contact fields — auditee/auditor
+ * CERTIFY name+title, CONTACT name+title, email, phone. None of those are
+ * loaded. Organizational identity (auditee_name, auditor_firm_name,
+ * addresses, EINs) is kept — it identifies the entity filing a mandatory
+ * federal disclosure, not a private individual. `fac_get_audit` used to also
+ * surface auditee contact name/email/phone from the live API; that capability
+ * is intentionally dropped here, not degraded — see the migration header for
+ * the full column-by-column reasoning.
+ *
+ * `data_as_of` is on every response (the last successful refresh,
+ * read from fac_ingest_runs via the fac_data_as_of() RPC).
+ *
+ * Tables loaded: general, federal_awards, findings, findings_text,
+ * corrective_action_plans. NOT loaded yet (out of #2504's scope):
+ * notes_to_sefa, passthrough, additional_ueis/eins/secondary_auditors — a
+ * future extension, not a silent gap; see the pack README.
  *
  * Tools:
  * - fac_search_audits:              find audits by auditee name/UEI/EIN/state/year/size
@@ -696,27 +723,36 @@ function collapse(s: string): string {
  * - fac_audit_findings:             audit findings for an audit or a recipient
  * - fac_federal_awards_by_program:  who expended money under a CFDA number
  * - fac_recipient_audit_history:    one recipient's audits and spend by year
+ * - fac_findings_search:            full-text search over finding narratives (NEW — a join api.fac.gov could not do)
+ * - fac_cross_table_screen:         screen audits by state + CFDA + finding type / material weakness in one call (NEW)
  */
 
 
-// Bound every fetch() in this pack to a fixed timeout — an upstream that
-// degrades without erroring would otherwise hold the Worker in `await fetch()`
-// until its own execution budget kills the request (minutes, not seconds).
-// Mirrors the epoFetch / usaspending retryFetch pattern (fleet #685).
 async function pwFetch(url: string | URL, init?: RequestInit): Promise<Response> {
-  return fetchWithTimeout(url, init ?? {}, 'Federal Audit Clearinghouse');
+  return fetchWithTimeout(url, init ?? {}, 'Federal Audit Clearinghouse data');
 }
 
-const BASE_URL = 'https://api.fac.gov';
+interface DbConfig {
+  url: string;
+  key: string;
+}
+
+type Row = Record<string, unknown>;
+
+interface NotFound {
+  found: false;
+  reason: string;
+  hint: string;
+}
 
 const GENERAL_SELECT =
   'report_id,auditee_uei,auditee_ein,audit_year,auditee_name,auditee_city,auditee_state,auditee_zip,total_amount_expended,fac_accepted_date,oversight_agency';
 
-const GENERAL_CONTACT_SELECT =
-  `${GENERAL_SELECT},auditee_email,auditee_phone,auditee_contact_name,auditee_contact_title,auditor_city,auditor_state`;
+const GENERAL_DETAIL_SELECT =
+  `${GENERAL_SELECT},cognizant_agency,auditor_firm_name,auditor_city,auditor_state,entity_type,audit_type,is_low_risk_auditee,dollar_threshold`;
 
 const AWARD_SELECT =
-  'report_id,federal_agency_prefix,federal_award_extension,additional_award_identification,federal_program_name,amount_expended,is_major,audit_report_type';
+  'report_id,award_reference,federal_agency_prefix,federal_award_extension,additional_award_identification,federal_program_name,amount_expended,is_major,audit_report_type';
 
 interface GeneralRow {
   report_id?: string;
@@ -730,10 +766,19 @@ interface GeneralRow {
   total_amount_expended?: number | string;
   fac_accepted_date?: string;
   oversight_agency?: string;
+  cognizant_agency?: string;
+  auditor_firm_name?: string;
+  auditor_city?: string;
+  auditor_state?: string;
+  entity_type?: string;
+  audit_type?: string;
+  is_low_risk_auditee?: string;
+  dollar_threshold?: number | string;
 }
 
 interface AwardRow {
   report_id?: string;
+  award_reference?: string;
   federal_agency_prefix?: string;
   federal_award_extension?: string;
   additional_award_identification?: string;
@@ -743,19 +788,11 @@ interface AwardRow {
   audit_report_type?: string;
 }
 
-type Row = Record<string, unknown>;
-
-interface NotFound {
-  found: false;
-  reason: string;
-  hint: string;
-}
-
 const tools: McpToolExport['tools'] = [
   {
     name: 'fac_search_audits',
     description:
-      'Search US single audits (Uniform Guidance / former OMB A-133) filed with the Federal Audit Clearinghouse — "the FAC" — by auditee name, UEI, EIN, state, ZIP code, audit year, or minimum federal dollars expended. Covers every kind of non-federal recipient: cities, towns, counties, school districts, fire and water districts, housing authorities, universities, tribes, hospitals and nonprofits. Returns the report_id, summary_url (the official FAC dissemination summary page for that submission), the organization name, city, state and ZIP on file, total federal awards expended for the year, the cognizant/oversight agency, and the date FAC accepted the submission. Puerto Rico municipalities are found under either their Spanish or English legal name. Answers "does this grant recipient file a single audit and how much federal money does it run", and "what is the FAC report ID / summary URL for this entity".',
+      'Search US single audits (Uniform Guidance / former OMB A-133) filed with the Federal Audit Clearinghouse — "the FAC" — by auditee name, UEI, EIN, state, ZIP code, audit year, or minimum federal dollars expended. Covers every kind of non-federal recipient: cities, towns, counties, school districts, fire and water districts, housing authorities, universities, tribes, hospitals and nonprofits. Returns the report_id, summary_url (the official FAC dissemination summary page for that submission), the organization name, city, state and ZIP on file, total federal awards expended for the year, the cognizant/oversight agency, and the date FAC accepted the submission. Puerto Rico municipalities are found under either their Spanish or English legal name. Answered without a live api.data.gov key or its rate limit. Answers "does this grant recipient file a single audit and how much federal money does it run", and "what is the FAC report ID / summary URL for this entity".',
     summary: 'US federal single audits (Uniform Guidance) matching a filter, from the Federal Audit Clearinghouse.',
     inputSchema: {
       type: 'object',
@@ -792,14 +829,14 @@ const tools: McpToolExport['tools'] = [
   {
     name: 'fac_get_audit',
     description:
-      'Fetch one single audit by its FAC report_id (e.g. "2025-09-GSAFAC-0000422512"), including its summary_url — the official Federal Audit Clearinghouse dissemination summary page for that report — enriched with the full federal program detail: every Assistance Listing (CFDA) number the entity expended money under, the program name, dollars expended per program, whether it was audited as a major program, and the opinion type. Also returns auditee contact and auditor details, plus audit findings when the FAC findings table carries them. Answers "what did this specific audit cover and what did it conclude".',
+      'Fetch one single audit by its FAC report_id (e.g. "2025-09-GSAFAC-0000422512"), including its summary_url — the official Federal Audit Clearinghouse dissemination summary page for that report — enriched with the full federal program detail: every Assistance Listing (CFDA) number the entity expended money under, the program name, dollars expended per program, whether it was audited as a major program, and the opinion type. Also returns the auditor firm and audit findings when FAC recorded any. Does NOT return named-individual contact details (auditee/auditor contact name, email, phone) — those are not carried here; see the report\'s summary_url on fac.gov for that. Answers "what did this specific audit cover and what did it conclude".',
     summary: 'One US federal single audit\'s full record, by id, from the Federal Audit Clearinghouse.',
     inputSchema: {
       type: 'object',
       properties: {
         report_id: {
           type: 'string',
-          description: 'FAC report id as returned by fac_search_audits, e.g. "2023-06-CENSUS-0000250449". Aliases: id, audit_id.',
+          description: 'FAC report id as returned by fac_search_audits, e.g. "2025-09-GSAFAC-0000422512". Aliases: id, audit_id.',
         },
         award_limit: { type: 'number', description: 'Max federal award rows to include, 1-500 (default 200).' },
         include_findings: { type: 'boolean', description: 'Attach audit findings for this report (default true).' },
@@ -819,7 +856,7 @@ const tools: McpToolExport['tools'] = [
         auditee_name: { type: 'string', description: 'Recipient name substring; the tool resolves matching audits first, then their findings. Aliases: query, q, name.' },
         uei: { type: 'string', description: 'Recipient UEI; resolves that recipient\'s audits, then their findings. Alias: auditee_uei.' },
         audit_year: { type: 'number', description: 'Restrict the resolved audits to one audit year (used with auditee_name or uei).' },
-        include_text: { type: 'boolean', description: 'Also attach the narrative finding text when FAC exposes it (default false — the text rows are long).' },
+        include_text: { type: 'boolean', description: 'Also attach the narrative finding text when FAC recorded any (default false — the text rows are long; a pre-2022 migrated audit often has none on file).' },
         limit: { type: 'number', description: 'Max finding rows to return, 1-200 (default 50).' },
       },
       required: [],
@@ -844,7 +881,7 @@ const tools: McpToolExport['tools'] = [
         major_only: { type: 'boolean', description: 'Keep only programs audited as major programs.' },
         min_amount: { type: 'number', description: 'Only rows expending at least this many dollars.' },
         limit: { type: 'number', description: 'Rows to return, 1-200 (default 25).' },
-        include_recipients: { type: 'boolean', description: 'Resolve each report_id to the recipient name and state (default true; one extra upstream call).' },
+        include_recipients: { type: 'boolean', description: 'Resolve each report_id to the recipient name and state (default true; one extra local query).' },
       },
       required: [],
     },
@@ -866,38 +903,51 @@ const tools: McpToolExport['tools'] = [
       required: [],
     },
   },
+  {
+    name: 'fac_findings_search',
+    description:
+      'Full-text search over audit finding NARRATIVES — the actual prose auditors wrote describing a compliance exception ("failed to submit the Federal Single Audit report within the timeframe prescribed", "total available cash was less than total advances from grantors"). This is not possible against the live FAC API, which exposes no cross-table join; it is what searching the underlying text directly unlocks. Optionally narrow by state, audit year, CFDA agency prefix, or material-weakness-only. Narrative text is only on file for more recent filings — audits migrated from the pre-2022 Census-run FAC often have none, and rows without text are simply not returned rather than shown blank. Answers "which audits mention X in their findings", e.g. "data security", "cash management", "timesheet".',
+    summary: 'Full-text search over Federal Audit Clearinghouse finding narratives.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Search phrase, e.g. "data security" or "questioned costs travel". Uses PostgreSQL websearch syntax (quote a phrase, "-word" to exclude). Aliases: q, text.' },
+        state: { type: 'string', description: '2-letter auditee state code to narrow the search, e.g. "TX".' },
+        audit_year: { type: 'number', description: 'Restrict to one audit year.' },
+        federal_agency_prefix: { type: 'string', description: 'Restrict to findings on awards under this 2-digit agency prefix (e.g. "93" for HHS). Alias: cfda_prefix.' },
+        material_weakness_only: { type: 'boolean', description: 'Only findings flagged as a material weakness.' },
+        limit: { type: 'number', description: 'Rows to return, 1-100 (default 25).' },
+        offset: { type: 'number', description: 'Rows to skip, for paging.' },
+      },
+      required: ['query'],
+    },
+  },
+  {
+    name: 'fac_cross_table_screen',
+    description:
+      'Screen single audits across state, federal program (CFDA), and finding type / material weakness in ONE call — a join FAC\'s own live API cannot express (its PostgREST has no foreign key between /general, /federal_awards and /findings). Answers compound diligence questions like "material weaknesses in Texas under CFDA 93.224" or "questioned-cost findings on highway funding (20.205) over $1M". Every filter is optional; pass at least one to keep the result meaningful. Returns one row per matching (audit, award, finding) combination, ranked by award dollar amount.',
+    summary: 'Cross-table screen (state + CFDA + finding type) over Federal Audit Clearinghouse data.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        state: { type: 'string', description: '2-letter auditee state code, e.g. "TX".' },
+        cfda: { type: 'string', description: 'Assistance Listing / CFDA number, e.g. "93.224" or a bare 2-digit agency prefix "93". Aliases: program_number, assistance_listing, program, cfda_number.' },
+        federal_agency_prefix: { type: 'string', description: 'Two-digit agency prefix on its own. Alias: prefix.' },
+        federal_award_extension: { type: 'string', description: 'Program extension on its own, e.g. "224". Alias: extension.' },
+        finding_type: { type: 'string', description: 'Substring match on FAC\'s finding type_requirement code (e.g. "A" internal control, "B" allowable costs — FAC packs several letters into one field, so this matches loosely).' },
+        material_weakness_only: { type: 'boolean', description: 'Only findings flagged as a material weakness.' },
+        min_amount: { type: 'number', description: 'Only award rows expending at least this many dollars.' },
+        audit_year: { type: 'number', description: 'Restrict to one audit year.' },
+        limit: { type: 'number', description: 'Rows to return, 1-100 (default 25).' },
+        offset: { type: 'number', description: 'Rows to skip, for paging.' },
+      },
+      required: [],
+    },
+  },
 ];
 
-async function callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
-  const apiKey = typeof args._apiKey === 'string' ? args._apiKey.trim() : '';
-  delete args._apiKey;
-  if (!apiKey) {
-    throw new Error(
-      'Federal Audit Clearinghouse requires an API key (from api.data.gov): pass your key as the _apiKey argument (free at https://api.data.gov/signup).',
-    );
-  }
-  const ignored = unrecognizedArgs(name, args);
-  return withArgWarning(name, await dispatch(name, apiKey, args), ignored);
-}
-
-async function dispatch(name: string, apiKey: string, args: Record<string, unknown>): Promise<unknown> {
-  switch (name) {
-    case 'fac_search_audits':
-      return searchAudits(apiKey, args);
-    case 'fac_get_audit':
-      return getAudit(apiKey, args);
-    case 'fac_audit_findings':
-      return auditFindings(apiKey, args);
-    case 'fac_federal_awards_by_program':
-      return awardsByProgram(apiKey, args);
-    case 'fac_recipient_audit_history':
-      return recipientHistory(apiKey, args);
-    default:
-      throw new Error(`Unknown tool: ${name}`);
-  }
-}
-
-/* ---------------------------------------------------------------- arg utils */
+/* ---------------------------------------------------------------- arg utils
+   (unchanged from the live-proxy version — these only build query strings) */
 
 function reqStr(args: Record<string, unknown>, key: string, example: string, ...aliases: string[]): string {
   for (const k of [key, ...aliases]) {
@@ -946,15 +996,9 @@ function num(v: unknown): number | undefined {
   return undefined;
 }
 
-/* ------------------------------------------------- zip + entity-name matching */
+/* ------------------------------------------------- zip + entity-name matching
+   (unchanged business logic — FAC's own data quirks, not an api.fac.gov artifact) */
 
-/**
- * FAC stores `auditee_zip` inconsistently: 5 digits ("75082"), 9-digit ZIP+4
- * with no hyphen ("009601588", "750814198"), and occasionally a hyphenated
- * form. An `eq.` filter therefore misses most of the table — a caller passing
- * a Puerto Rico municipality's "00960" would match nothing at all. Filter on
- * the 5-digit prefix instead, which is the only part both encodings share.
- */
 function zipPrefix(raw: string | undefined): string | undefined {
   if (!raw) return undefined;
   const digits = raw.replace(/\D/g, '');
@@ -966,61 +1010,27 @@ function applyZipFilter(params: URLSearchParams, zip5: string | undefined): void
   if (zip5) params.set('auditee_zip', `like.${zip5}*`);
 }
 
-/**
- * Strip the characters that are structural inside a PostgREST `or=(...)` list
- * or inside an ilike pattern, so a caller-supplied name can never break the
- * query it lands in.
- */
 function safePattern(v: string): string {
   return v.replace(/[,()"*\\]/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
-/**
- * Puerto Rico municipalities are filed under BOTH languages, and which one you
- * get depends on the year the submission was made — "MUNICIPALITY OF COROZAL"
- * for 2017-2024 but "MUNICIPIO DE COROZAL" for 2019, from the same entity.
- * A caller holding the Spanish legal name ("MUNICIPIO DE BAYAMON") therefore
- * cannot reach the English rows, and a one-way rewrite to English would lose
- * the Spanish ones. Match both spellings and let PostgREST union them.
- *
- * Also handles "AUTONOMOUS MUNICIPALITY OF CAGUAS" and "MUNICIPIO AUTONOMO DE
- * CAGUAS" — the place name is what carries, the honorific is not.
- */
 const MUNI_RE =
   /^\s*(?:municipio(?:\s+autonomo)?|municipalidad(?:\s+autonoma)?|(?:autonomous\s+)?municipality)\s+(?:de\s+la|de\s+los|del|de|of\s+the|of)\s+(.+?)\s*$/i;
 
-/**
- * Accent-tolerant variant of a place name. FAC holds "MUNICIPALITY OF AÑASCO"
- * (and, in one row, the mojibaked "MUNICIPALITY OF A?ASCO") but also the plain
- * "MUNICIPIO DE ANASCO" — so *neither* spelling finds all of them. Replacing
- * the letters that can carry a Spanish accent with LIKE's single-character
- * wildcard matches every form at once; the surviving consonants and the fixed
- * length keep it specific, and the "Municipality of " prefix bounds it further.
- *
- * This has to ride in the PRIMARY query, not as a retry-on-empty. A retry only
- * fires when the literal spelling found nothing, and the real failure here is
- * that it finds SOME rows — plain "ANASCO" returns the 1 unaccented filing and
- * silently drops the 4 accented ones, which is a partial answer wearing the
- * shape of a complete one.
- */
 function accentTolerant(place: string): string | undefined {
-  if (/[^\x00-\x7F]/.test(place)) return undefined; // already accented — the literal is exact
+  if (/[^\x00-\x7F]/.test(place)) return undefined;
   const loose = place.replace(/[aeiounAEIOUN]/g, '_');
   return loose === place ? undefined : loose;
 }
 
 interface NameMatch {
-  /** Applied to a URLSearchParams to express the name condition. */
   apply: (params: URLSearchParams) => void;
-  /** Human-readable note when we matched on more than the literal string. */
   note?: string;
 }
 
 function orIlike(patterns: string[]): (params: URLSearchParams) => void {
   const uniq = [...new Set(patterns)];
   return (params) => {
-    // `or=(...)` is one SQL predicate, so a row matching several branches is
-    // still returned once — the branches union, they do not multiply.
     if (uniq.length === 1) params.set('auditee_name', `ilike.*${uniq[0]}*`);
     else params.set('or', `(${uniq.map((p) => `auditee_name.ilike.*${p}*`).join(',')})`);
   };
@@ -1049,19 +1059,11 @@ function nameMatch(rawName: string): NameMatch {
   };
 }
 
-/** The hint that explains WHY a municipality name missed, not just that it did. */
 const MUNI_HINT =
   'For Puerto Rico municipalities, FAC files under the English name ("MUNICIPALITY OF BAYAMON") about as often as the Spanish one ("MUNICIPIO DE MANATI"), and spells places with their accents ("MUNICIPALITY OF AÑASCO"). This tool already searches both languages — if it still missed, try the bare place name on its own with state="PR".';
 
 /* --------------------------------------------- unrecognized-argument guard */
 
-/**
- * Every argument key each tool actually reads, aliases included. A key that is
- * not here was silently discarded before — which is the worst failure mode for
- * a caller doing precise lookups, because dropping the most specific thing they
- * said still returns a plausible-looking row and hides that their question was
- * never asked. Warn loudly instead.
- */
 const ACCEPTED_ARGS: Record<string, string[]> = {
   fac_search_audits: [
     'auditee_name', 'query', 'q', 'name',
@@ -1089,6 +1091,15 @@ const ACCEPTED_ARGS: Record<string, string[]> = {
     'auditee_name', 'query', 'q', 'name',
     'state', 'auditee_state', 'years', 'limit',
   ],
+  fac_findings_search: [
+    'query', 'q', 'text', 'state', 'audit_year',
+    'federal_agency_prefix', 'cfda_prefix', 'material_weakness_only', 'limit', 'offset',
+  ],
+  fac_cross_table_screen: [
+    'state', 'cfda', 'program_number', 'assistance_listing', 'program', 'cfda_number',
+    'federal_agency_prefix', 'prefix', 'federal_award_extension', 'extension',
+    'finding_type', 'material_weakness_only', 'min_amount', 'audit_year', 'limit', 'offset',
+  ],
 };
 
 function unrecognizedArgs(tool: string, args: Record<string, unknown>): string[] {
@@ -1098,11 +1109,6 @@ function unrecognizedArgs(tool: string, args: Record<string, unknown>): string[]
   return Object.keys(args).filter((k) => !k.startsWith('_') && !known.has(k) && args[k] !== undefined && args[k] !== null);
 }
 
-/**
- * Attach the warning to whatever the tool returned. It rides on the response
- * rather than throwing, so an otherwise-good answer still reaches the caller —
- * but the response now says out loud that a filter they passed was not applied.
- */
 function withArgWarning(tool: string, result: unknown, ignored: string[]): unknown {
   if (ignored.length === 0) return result;
   if (!result || typeof result !== 'object' || Array.isArray(result)) return result;
@@ -1116,135 +1122,100 @@ function withArgWarning(tool: string, result: unknown, ignored: string[]): unkno
   };
 }
 
-/* --------------------------------------------------------------- http layer */
+/* --------------------------------------------------------------- db layer */
 
-interface UmbrellaError {
-  error?: { code?: string; message?: string };
-}
-
-async function facRequest(
-  apiKey: string,
-  path: string,
-  params: URLSearchParams,
-): Promise<{ status: number; body: unknown; text: string }> {
+async function sbRequest(cfg: DbConfig, path: string, params: URLSearchParams): Promise<Response> {
   const qs = params.toString();
-  const url = `${BASE_URL}${path}${qs ? `?${qs}` : ''}`;
-  const res = await pwFetch(url, {
-    headers: { 'X-Api-Key': apiKey, Accept: 'application/json' },
+  const url = `${cfg.url}/rest/v1${path}${qs ? `?${qs}` : ''}`;
+  return pwFetch(url, {
+    headers: { apikey: cfg.key, Authorization: `Bearer ${cfg.key}`, Accept: 'application/json' },
   });
-  const text = await res.text();
-  let body: unknown = null;
-  if (text) {
-    try {
-      body = JSON.parse(text);
-    } catch {
-      body = null;
-    }
-  }
-  return { status: res.status, body, text };
 }
 
-const UMBRELLA_CODES = [
-  'OVER_RATE_LIMIT',
-  'API_KEY_MISSING',
-  'API_KEY_INVALID',
-  'API_KEY_DISABLED',
-  'API_KEY_UNAUTHORIZED',
-];
-
-/**
- * api.data.gov wraps throttle/auth failures in a body that can arrive with HTTP
- * 200. It is usually JSON (`{"error":{"code":"OVER_RATE_LIMIT",...}}`) but the
- * umbrella also serves an HTML error page carrying the same code, so the raw
- * text is checked too — otherwise an HTML 200 looks like a malformed response
- * instead of the plain "you are throttled" that it is.
- */
-function umbrellaError(body: unknown, text?: string): { code: string; message: string } | null {
-  if (body && typeof body === 'object' && !Array.isArray(body)) {
-    const err = (body as UmbrellaError).error;
-    if (err && typeof err === 'object') {
-      return {
-        code: typeof err.code === 'string' ? err.code : 'UMBRELLA_ERROR',
-        message: typeof err.message === 'string' ? err.message : '',
-      };
-    }
+/** Rows from a local FAC table. Throws on real errors; never returns null for an empty table. */
+async function sbRows(cfg: DbConfig, path: string, params: URLSearchParams): Promise<Row[]> {
+  const res = await sbRequest(cfg, path, params);
+  if (!res.ok) throw await httpError(res, 'Federal Audit Clearinghouse data');
+  const body = await res.json();
+  if (!Array.isArray(body)) {
+    throw new Error('Federal Audit Clearinghouse data: expected a row array — treating this as a failure rather than an empty result.');
   }
-  if (text && !Array.isArray(body)) {
-    for (const code of UMBRELLA_CODES) {
-      if (text.includes(code)) return { code, message: text.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 200) };
-    }
-  }
-  return null;
+  return body as Row[];
 }
 
-function throwUmbrella(code: string, message: string): never {
-  if (code === 'OVER_RATE_LIMIT') {
-    throw new Error(
-      `FAC: api.data.gov rate limit exceeded (${code}). The umbrella returns this even with HTTP 200. The key's hourly quota is exhausted (a registered key gets 1,000/hour; DEMO_KEY gets 10 on api.fac.gov) — retry after the top of the hour, or bring your own key via ?_apiKey= (free at https://api.data.gov/signup). ${message}`,
-    );
-  }
-  if (code === 'API_KEY_MISSING' || code === 'API_KEY_INVALID' || code === 'API_KEY_DISABLED' || code === 'API_KEY_UNAUTHORIZED') {
-    throw new Error(`FAC: api.data.gov rejected the key (${code}). Register a fresh one at https://api.data.gov/signup. ${message}`);
-  }
-  throw new Error(`FAC: api.data.gov error ${code}. ${message}`);
-}
-
-/** Rows from a PostgREST table. Throws on real errors; never returns null. */
-async function facRows(apiKey: string, path: string, params: URLSearchParams): Promise<Row[]> {
-  const { status, body, text } = await facRequest(apiKey, path, params);
-  const err = umbrellaError(body, text);
-  if (err) throwUmbrella(err.code, err.message);
-  if (status === 401 || status === 403) throw new Error(`FAC: unauthorized (HTTP ${status}) — check the api.data.gov key.`);
-  if (status === 429) throw new Error('FAC: rate limit (HTTP 429) — api.data.gov throttled the key.');
-  if (status === 408) throw new Error(`FAC: api.fac.gov timed out (HTTP 408) on ${path} — it does this under load; narrow the filters or retry shortly.`);
-  if (status >= 500) throw new Error(`FAC: upstream ${status} — api.fac.gov is unavailable, retry shortly.`);
-  if (status === 404) throw new Error(`FAC: table ${path} does not exist on api.fac.gov (HTTP 404).`);
-  if (status >= 400) {
-    throw new Error(`FAC error ${status} on ${path}: ${text.slice(0, 300)}`);
-  }
-  return expectRows(path, status, body, text);
-}
-
-/**
- * A 2xx that isn't a JSON array is a broken response, not an empty table —
- * returning [] there would report "no rows" for what is really an upstream or
- * intermediary failure, which is the worst possible answer to a diligence
- * question. Fail loudly instead.
- */
-function expectRows(path: string, status: number, body: unknown, text: string): Row[] {
-  if (Array.isArray(body)) return body as Row[];
-  throw new Error(
-    `FAC: HTTP ${status} on ${path} but the body was not a JSON array of rows — treating this as an upstream failure rather than an empty result. Body: ${text.slice(0, 200)}`,
-  );
-}
-
-/**
- * Same as facRows but folds a missing/renamed table or a rejected column into
- * `null` instead of throwing, so a supplementary lookup (findings, finding
- * text) can degrade quietly while the primary answer still returns.
- */
-async function facRowsOptional(
-  apiKey: string,
+/** Same as sbRows but folds a missing/renamed table into null so a supplementary lookup can degrade quietly. */
+async function sbRowsOptional(
+  cfg: DbConfig,
   path: string,
   params: URLSearchParams,
-): Promise<{ rows: Row[] } | { rows: null; status: number; detail: string }> {
-  const { status, body, text } = await facRequest(apiKey, path, params);
-  const err = umbrellaError(body, text);
-  if (err) throwUmbrella(err.code, err.message);
-  if (status === 404 || status === 400 || status === 406) {
-    return { rows: null, status, detail: text.slice(0, 200) };
+): Promise<{ rows: Row[] } | { rows: null; status: number }> {
+  const res = await sbRequest(cfg, path, params);
+  if (res.status === 404 || res.status === 400 || res.status === 406) {
+    return { rows: null, status: res.status };
   }
-  if (status === 401 || status === 403) throw new Error(`FAC: unauthorized (HTTP ${status}) — check the api.data.gov key.`);
-  if (status === 429) throw new Error('FAC: rate limit (HTTP 429) — api.data.gov throttled the key.');
-  if (status === 408) throw new Error(`FAC: api.fac.gov timed out (HTTP 408) on ${path} — it does this under load; retry shortly.`);
-  if (status >= 500) throw new Error(`FAC: upstream ${status} — api.fac.gov is unavailable, retry shortly.`);
-  return { rows: expectRows(path, status, body, text) };
+  if (!res.ok) throw await httpError(res, 'Federal Audit Clearinghouse data');
+  const body = await res.json();
+  if (!Array.isArray(body)) {
+    throw new Error('Federal Audit Clearinghouse data: expected a row array — treating this as a failure rather than an empty result.');
+  }
+  return { rows: body as Row[] };
+}
+
+/** Call an RPC (the cross-table joins the local schema exposes that plain PostgREST filters cannot). */
+async function sbRpc(cfg: DbConfig, fn: string, body: Record<string, unknown>): Promise<Row[]> {
+  const url = `${cfg.url}/rest/v1/rpc/${fn}`;
+  const res = await pwFetch(url, {
+    method: 'POST',
+    headers: {
+      apikey: cfg.key,
+      Authorization: `Bearer ${cfg.key}`,
+      'Content-Type': 'application/json',
+      Prefer: 'params=single-object',
+    },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw await httpError(res, 'Federal Audit Clearinghouse data');
+  const parsed = await res.json();
+  if (!Array.isArray(parsed)) {
+    throw new Error('Federal Audit Clearinghouse data: RPC did not return a row array — treating this as a failure.');
+  }
+  return parsed as Row[];
+}
+
+let cachedDataAsOf: string | null | undefined;
+
+/** The last successful refresh, read once per Worker instance and reused across tool calls in the same call. */
+async function dataAsOf(cfg: DbConfig): Promise<string | null> {
+  if (cachedDataAsOf !== undefined) return cachedDataAsOf;
+  try {
+    const rows = await sbRows(
+      cfg,
+      '/fac_ingest_runs',
+      new URLSearchParams({ status: 'eq.ok', select: 'finished_at', order: 'finished_at.desc', limit: '1' }),
+    );
+    cachedDataAsOf = rows.length ? (rows[0]['finished_at'] as string) : null;
+  } catch {
+    cachedDataAsOf = null; // freshness is metadata, never the reason a call fails
+  }
+  return cachedDataAsOf;
+}
+
+function withDataAsOf<T extends Record<string, unknown>>(result: T, asOf: string | null): T & { data_as_of: string | null } {
+  return {
+    ...result,
+    data_as_of: asOf,
+    ...(asOf
+      ? {}
+      : {
+          coverage_status:
+            'This data source has not completed its first load yet — results may be empty or incomplete. This is a deployment state, not a query problem.',
+        }),
+  };
 }
 
 /* ------------------------------------------------------------- shared shape */
 
 function inList(values: string[]): string {
-  // PostgREST `in.(a,b,c)`; quote so ids containing punctuation survive.
   return `in.(${values.map((v) => `"${v.replace(/"/g, '')}"`).join(',')})`;
 }
 
@@ -1259,6 +1230,7 @@ function shapeAward(row: Row): Record<string, unknown> {
   const a = row as AwardRow;
   return {
     report_id: a.report_id,
+    award_reference: a.award_reference,
     assistance_listing: assistanceListing(a),
     federal_program_name: a.federal_program_name,
     amount_expended: num(a.amount_expended),
@@ -1275,8 +1247,8 @@ function shapeFinding(row: Row): Record<string, unknown> {
     report_id: row.report_id,
     auditee_uei: row.auditee_uei,
     audit_year: num(row.audit_year) ?? row.audit_year,
-    reference_number: row.reference_number,
     award_reference: row.award_reference,
+    reference_number: row.reference_number,
     type_requirement: row.type_requirement,
     is_material_weakness: row.is_material_weakness,
     is_significant_deficiency: row.is_significant_deficiency,
@@ -1289,7 +1261,6 @@ function shapeFinding(row: Row): Record<string, unknown> {
   };
 }
 
-/** Roll the Y/N flags up so a caller sees severity without scanning rows. */
 function findingsSummary(rows: Row[]): Record<string, number> {
   return {
     findings: rows.length,
@@ -1301,15 +1272,11 @@ function findingsSummary(rows: Row[]): Record<string, number> {
   };
 }
 
-// The public FAC page for one submission. Not a column the API returns — it is
-// a deterministic path off report_id (verified live: /dissemination/summary/
-// 2025-09-GSAFAC-0000422512 is a 200 carrying CENTRAL FALLS HOUSING AUTHORITY).
-// It is here because callers keep asking for it BY NAME ("return the report ID
-// and summary URL", "the canonical official dissemination summary URL"), and
-// without the field the router's selector read the tool list, correctly
-// observed that no tool returns a dissemination URL, and refused the whole
-// question — throwing away the audit record it could have answered with.
-// A URL we can build exactly is better returned than withheld.
+// The public FAC page for one submission. Not a column the local table carries —
+// it is a deterministic path off report_id (verified live: /dissemination/
+// summary/2025-09-GSAFAC-0000422512 is a 200 carrying CENTRAL FALLS HOUSING
+// AUTHORITY). Kept from the live-proxy version for the same reason it was
+// added there: callers keep asking for it BY NAME.
 const summaryUrl = (reportId: string | undefined): string | undefined =>
   reportId ? `https://app.fac.gov/dissemination/summary/${encodeURIComponent(reportId)}` : undefined;
 
@@ -1335,7 +1302,7 @@ function shapeGeneral(row: Row): Record<string, unknown> {
 
 const ORDER_COLUMNS = new Set(['total_amount_expended', 'audit_year', 'fac_accepted_date', 'auditee_name']);
 
-async function searchAudits(apiKey: string, args: Record<string, unknown>) {
+async function searchAudits(cfg: DbConfig, args: Record<string, unknown>) {
   const name = optStr(args, 'auditee_name', 'query', 'q', 'name');
   const uei = optStr(args, 'uei', 'auditee_uei');
   const ein = optStr(args, 'ein', 'auditee_ein');
@@ -1390,18 +1357,14 @@ async function searchAudits(apiKey: string, args: Record<string, unknown>) {
   const params = baseParams();
   match?.apply(params);
   applyZipFilter(params, zip5);
-  const rows = await facRows(apiKey, '/general', params);
+  const rows = await sbRows(cfg, '/fac_general', params);
 
   if (rows.length === 0) {
-    // A ZIP that filtered everything away is the most likely culprit, and the
-    // caller cannot tell that from a generic miss. Re-ask without it and name
-    // the ZIPs FAC actually holds, so "75083" gets told about "75082" instead
-    // of being left to guess.
     if (zip5) {
       const probe = baseParams();
       probe.set('limit', '25');
       match?.apply(probe);
-      const without = await facRows(apiKey, '/general', probe);
+      const without = await sbRows(cfg, '/fac_general', probe);
       if (without.length > 0) {
         const zips = [...new Set(without.map((r) => (r as GeneralRow).auditee_zip).filter(Boolean) as string[])];
         return {
@@ -1442,27 +1405,27 @@ async function searchAudits(apiKey: string, args: Record<string, unknown>) {
 
 /* ---------------------------------------------------------- 2. fac_get_audit */
 
-async function getAudit(apiKey: string, args: Record<string, unknown>) {
-  const reportId = reqStr(args, 'report_id', '"2023-06-CENSUS-0000250449"', 'id', 'audit_id');
+async function getAudit(cfg: DbConfig, args: Record<string, unknown>) {
+  const reportId = reqStr(args, 'report_id', '"2025-09-GSAFAC-0000422512"', 'id', 'audit_id');
   const awardLimit = clampInt(optNum(args, 'award_limit'), 200, 1, 500);
 
-  const generalRows = await facRows(
-    apiKey,
-    '/general',
-    new URLSearchParams({ select: GENERAL_CONTACT_SELECT, report_id: `eq.${reportId}`, limit: '1' }),
+  const generalRows = await sbRows(
+    cfg,
+    '/fac_general',
+    new URLSearchParams({ select: GENERAL_DETAIL_SELECT, report_id: `eq.${reportId}`, limit: '1' }),
   );
   if (generalRows.length === 0) {
     return {
       found: false,
       reason: 'report_id_not_found',
-      hint: `No audit with report_id "${reportId}". Report ids look like "2023-06-CENSUS-0000250449"; get one from fac_search_audits.`,
+      hint: `No audit with report_id "${reportId}". Report ids look like "2025-09-GSAFAC-0000422512"; get one from fac_search_audits.`,
     } satisfies NotFound;
   }
   const g = generalRows[0] as GeneralRow & Row;
 
-  const awards = await facRows(
-    apiKey,
-    '/federal_awards',
+  const awards = await sbRows(
+    cfg,
+    '/fac_federal_awards',
     new URLSearchParams({
       select: AWARD_SELECT,
       report_id: `eq.${reportId}`,
@@ -1481,13 +1444,14 @@ async function getAudit(apiKey: string, args: Record<string, unknown>) {
     report_id: reportId,
     audit: {
       ...shapeGeneral(g),
-      auditee_zip: g['auditee_zip'],
-      auditee_contact_name: g['auditee_contact_name'],
-      auditee_contact_title: g['auditee_contact_title'],
-      auditee_email: g['auditee_email'],
-      auditee_phone: g['auditee_phone'],
-      auditor_city: g['auditor_city'],
-      auditor_state: g['auditor_state'],
+      cognizant_agency: g.cognizant_agency,
+      auditor_firm_name: g.auditor_firm_name,
+      auditor_city: g.auditor_city,
+      auditor_state: g.auditor_state,
+      entity_type: g.entity_type,
+      audit_type: g.audit_type,
+      is_low_risk_auditee: g.is_low_risk_auditee,
+      dollar_threshold: num(g.dollar_threshold),
     },
     federal_awards: {
       program_count: programs,
@@ -1496,19 +1460,21 @@ async function getAudit(apiKey: string, args: Record<string, unknown>) {
       truncated: awards.length === awardLimit,
       rows: shapedAwards,
     },
+    personal_data_note:
+      'Named-individual contact fields (auditee/auditor contact name, email, phone) are not carried here. See summary_url for FAC\'s own record if you need them.',
     source: 'Federal Audit Clearinghouse /general + /federal_awards',
   };
 
   if (optBool(args, 'include_findings', true)) {
-    const findings = await facRowsOptional(
-      apiKey,
-      '/findings',
+    const findings = await sbRowsOptional(
+      cfg,
+      '/fac_findings',
       new URLSearchParams({ report_id: `eq.${reportId}`, limit: '100' }),
     );
     if (findings.rows === null) {
       result.findings = {
         available: false,
-        reason: `FAC /findings returned HTTP ${findings.status}`,
+        reason: `Federal Audit Clearinghouse data returned HTTP ${findings.status}`,
         hint: 'The findings table did not answer; the per-program audit_report_type above is the surviving compliance signal.',
       };
     } else {
@@ -1526,7 +1492,7 @@ async function getAudit(apiKey: string, args: Record<string, unknown>) {
 
 /* ----------------------------------------------------- 3. fac_audit_findings */
 
-async function auditFindings(apiKey: string, args: Record<string, unknown>) {
+async function auditFindings(cfg: DbConfig, args: Record<string, unknown>) {
   const reportId = optStr(args, 'report_id', 'id', 'audit_id');
   const name = optStr(args, 'auditee_name', 'query', 'q', 'name');
   const uei = optStr(args, 'uei', 'auditee_uei');
@@ -1543,8 +1509,6 @@ async function auditFindings(apiKey: string, args: Record<string, unknown>) {
     scope.report_id = reportId;
     reportIds = [reportId];
   } else if (uei) {
-    // /findings carries auditee_uei and audit_year itself, so a recipient sweep
-    // filters directly — no /general resolution hop, and no 25-audit ceiling.
     params.set('auditee_uei', `eq.${uei.toUpperCase()}`);
     scope.auditee_uei = uei.toUpperCase();
     if (auditYear !== undefined) {
@@ -1552,7 +1516,6 @@ async function auditFindings(apiKey: string, args: Record<string, unknown>) {
       scope.audit_year = Math.trunc(auditYear);
     }
   } else if (name) {
-    // /findings has no auditee_name column, so a name has to become report_ids first.
     const match = nameMatch(name);
     const buildGp = (m: NameMatch): URLSearchParams => {
       const gp = new URLSearchParams({ select: GENERAL_SELECT, order: 'audit_year.desc', limit: '25' });
@@ -1560,7 +1523,7 @@ async function auditFindings(apiKey: string, args: Record<string, unknown>) {
       if (auditYear !== undefined) gp.set('audit_year', `eq.${Math.trunc(auditYear)}`);
       return gp;
     };
-    const generalRows = await facRows(apiKey, '/general', buildGp(match));
+    const generalRows = await sbRows(cfg, '/fac_general', buildGp(match));
     if (generalRows.length === 0) {
       return {
         found: false,
@@ -1581,13 +1544,13 @@ async function auditFindings(apiKey: string, args: Record<string, unknown>) {
     } satisfies NotFound;
   }
 
-  const findings = await facRowsOptional(apiKey, '/findings', params);
+  const findings = await sbRowsOptional(cfg, '/fac_findings', params);
 
   if (findings.rows === null) {
     return {
       found: false,
       reason: 'findings_table_unavailable',
-      hint: `FAC /findings answered HTTP ${findings.status}. Use fac_get_audit for the same report_id — its federal award rows carry audit_report_type (the per-program opinion), which is the surviving compliance signal. Detail: ${findings.detail}`,
+      hint: `Federal Audit Clearinghouse data answered HTTP ${findings.status}. Use fac_get_audit for the same report_id — its federal award rows carry audit_report_type (the per-program opinion), which is the surviving compliance signal.`,
     } satisfies NotFound;
   }
 
@@ -1616,23 +1579,23 @@ async function auditFindings(apiKey: string, args: Record<string, unknown>) {
   };
 
   if (optBool(args, 'include_text', false)) {
-    // Narrative text keys on report_id + finding_ref_number; scope it to the
-    // reports we actually returned rows for so the payload stays bounded.
     const textParams = new URLSearchParams({ limit: String(limit) });
     textParams.set('report_id', shapedIds.length === 1 ? `eq.${shapedIds[0]}` : inList(shapedIds));
-    const texts = await facRowsOptional(apiKey, '/findings_text', textParams);
+    const texts = await sbRowsOptional(cfg, '/fac_findings_text', textParams);
     result.findings_text =
       texts.rows === null
-        ? { available: false, reason: `FAC /findings_text returned HTTP ${texts.status}` }
+        ? { available: false, reason: `Federal Audit Clearinghouse data returned HTTP ${texts.status}` }
         : {
             available: true,
-            count: texts.rows.length,
-            rows: texts.rows.map((r) => ({
-              report_id: r.report_id,
-              finding_ref_number: r.finding_ref_number,
-              contains_chart_or_table: r.contains_chart_or_table,
-              finding_text: typeof r.finding_text === 'string' ? r.finding_text.trim() : r.finding_text,
-            })),
+            count: texts.rows.filter((r) => r.finding_text).length,
+            rows: texts.rows
+              .filter((r) => r.finding_text)
+              .map((r) => ({
+                report_id: r.report_id,
+                finding_ref_number: r.finding_ref_number,
+                finding_text: typeof r.finding_text === 'string' ? r.finding_text.trim() : r.finding_text,
+              })),
+            note: 'Rows with no narrative on file (common for audits migrated from the pre-2022 Census-run FAC) are omitted rather than shown blank.',
           };
   }
 
@@ -1669,8 +1632,6 @@ function resolveProgram(args: Record<string, unknown>): ProgramRef | NotFound {
     }
   }
 
-  // FAC stores the extension zero-padded to three characters ("076", not "76"),
-  // so a caller who writes "47.76" still resolves to the right program.
   if (extension && /^\d{1,3}$/.test(extension)) extension = extension.padStart(3, '0');
 
   if (!prefix || !/^\d{1,2}$/.test(prefix)) {
@@ -1684,7 +1645,7 @@ function resolveProgram(args: Record<string, unknown>): ProgramRef | NotFound {
   return { prefix, extension, label: extension ? `${prefix}.${extension}` : prefix };
 }
 
-async function awardsByProgram(apiKey: string, args: Record<string, unknown>) {
+async function awardsByProgram(cfg: DbConfig, args: Record<string, unknown>) {
   const program = resolveProgram(args);
   if ('found' in program) return program;
 
@@ -1695,9 +1656,6 @@ async function awardsByProgram(apiKey: string, args: Record<string, unknown>) {
   const minAmount = optNum(args, 'min_amount', 'min_expended');
   const wantRecipients = optBool(args, 'include_recipients', true);
 
-  // /federal_awards has no auditee columns, so state / audit_year are applied
-  // against the /general rows we join for recipient identity. Over-fetch when a
-  // recipient-side filter is in play so the post-join ranking still fills up.
   const recipientFilter = Boolean(state) || auditYear !== undefined;
   const fetchLimit = recipientFilter ? Math.min(500, limit * 8) : limit;
 
@@ -1711,7 +1669,7 @@ async function awardsByProgram(apiKey: string, args: Record<string, unknown>) {
   if (majorOnly) params.set('is_major', 'eq.Y');
   if (minAmount !== undefined) params.set('amount_expended', `gte.${Math.trunc(minAmount)}`);
 
-  const awardRows = await facRows(apiKey, '/federal_awards', params);
+  const awardRows = await sbRows(cfg, '/fac_federal_awards', params);
   if (awardRows.length === 0) {
     return {
       found: false,
@@ -1726,9 +1684,9 @@ async function awardsByProgram(apiKey: string, args: Record<string, unknown>) {
   if (wantRecipients || recipientFilter) {
     const ids = [...new Set(shaped.map((r) => String(r.report_id ?? '')).filter(Boolean))].slice(0, 200);
     if (ids.length) {
-      const generalRows = await facRows(
-        apiKey,
-        '/general',
+      const generalRows = await sbRows(
+        cfg,
+        '/fac_general',
         new URLSearchParams({ select: GENERAL_SELECT, report_id: inList(ids), limit: String(ids.length) }),
       );
       for (const row of generalRows) {
@@ -1786,7 +1744,7 @@ async function awardsByProgram(apiKey: string, args: Record<string, unknown>) {
 
 /* -------------------------------------------- 5. fac_recipient_audit_history */
 
-async function recipientHistory(apiKey: string, args: Record<string, unknown>) {
+async function recipientHistory(cfg: DbConfig, args: Record<string, unknown>) {
   const uei = optStr(args, 'uei', 'auditee_uei');
   const ein = optStr(args, 'ein', 'auditee_ein');
   const name = optStr(args, 'auditee_name', 'query', 'q', 'name');
@@ -1815,7 +1773,7 @@ async function recipientHistory(apiKey: string, args: Record<string, unknown>) {
     return params;
   };
 
-  const rows = await facRows(apiKey, '/general', buildParams(match));
+  const rows = await sbRows(cfg, '/fac_general', buildParams(match));
   if (rows.length === 0) {
     return {
       found: false,
@@ -1826,7 +1784,6 @@ async function recipientHistory(apiKey: string, args: Record<string, unknown>) {
 
   const shaped = rows.map(shapeGeneral);
 
-  // Name search can straddle several legal entities; say which one this is.
   const entities = new Map<string, { auditee_uei?: string; auditee_name?: string; auditee_state?: string; audits: number }>();
   for (const r of shaped) {
     const key = String(r.auditee_uei ?? r.auditee_ein ?? r.auditee_name ?? 'unknown');
@@ -1876,6 +1833,175 @@ async function recipientHistory(apiKey: string, args: Record<string, unknown>) {
     audits: shaped,
     source: 'Federal Audit Clearinghouse /general',
   };
+}
+
+/* --------------------------------------------------- 6. fac_findings_search */
+
+async function findingsSearch(cfg: DbConfig, args: Record<string, unknown>) {
+  const q = reqStr(args, 'query', '"data security"', 'q', 'text');
+  const state = optStr(args, 'state');
+  const auditYear = optNum(args, 'audit_year');
+  const prefix = optStr(args, 'federal_agency_prefix', 'cfda_prefix');
+  const materialOnly = optBool(args, 'material_weakness_only', false);
+  const limit = clampInt(optNum(args, 'limit'), 25, 1, 100);
+  const offset = clampInt(optNum(args, 'offset'), 0, 0, 5000);
+
+  const rows = await sbRpc(cfg, 'fac_findings_search', {
+    q,
+    state_in: state ? state.toUpperCase() : null,
+    audit_year_in: auditYear !== undefined ? Math.trunc(auditYear) : null,
+    cfda_prefix_in: prefix ? prefix.padStart(2, '0') : null,
+    material_weakness_only: materialOnly,
+    lim: limit,
+    off: offset,
+  });
+
+  if (rows.length === 0) {
+    return {
+      found: false,
+      reason: 'no_findings_matched',
+      hint: `No finding narrative matched "${q}"${state ? ` in ${state.toUpperCase()}` : ''}. Try a shorter or less specific phrase — narrative text is only on file for more recent filings, so a very narrow search over an older audit year can legitimately come back empty.`,
+      query: q,
+    } satisfies NotFound & { query: string };
+  }
+
+  return {
+    found: true,
+    query: q,
+    filters: { state: state?.toUpperCase(), audit_year: auditYear, federal_agency_prefix: prefix, material_weakness_only: materialOnly || undefined },
+    count: rows.length,
+    truncated: rows.length === limit,
+    results: rows.map((r) => ({
+      report_id: r.report_id,
+      summary_url: summaryUrl(r.report_id as string | undefined),
+      auditee_name: r.auditee_name,
+      auditee_state: r.auditee_state,
+      audit_year: num(r.audit_year) ?? r.audit_year,
+      finding_ref_number: r.finding_ref_number,
+      type_requirement: r.type_requirement,
+      is_material_weakness: r.is_material_weakness,
+      is_significant_deficiency: r.is_significant_deficiency,
+      finding_text: r.finding_text,
+      rank: num(r.rank),
+    })),
+    source: 'Federal Audit Clearinghouse, full-text search over finding narratives',
+  };
+}
+
+/* ---------------------------------------------- 7. fac_cross_table_screen */
+
+async function crossTableScreen(cfg: DbConfig, args: Record<string, unknown>) {
+  const state = optStr(args, 'state');
+  const findingType = optStr(args, 'finding_type');
+  const materialOnly = optBool(args, 'material_weakness_only', false);
+  const minAmount = optNum(args, 'min_amount');
+  const auditYear = optNum(args, 'audit_year');
+  const limit = clampInt(optNum(args, 'limit'), 25, 1, 100);
+  const offset = clampInt(optNum(args, 'offset'), 0, 0, 5000);
+
+  let prefix: string | undefined;
+  let extension: string | undefined;
+  if (args.cfda || args.program_number || args.assistance_listing || args.program || args.cfda_number || args.federal_agency_prefix || args.prefix) {
+    const program = resolveProgram(args);
+    if ('found' in program) return program;
+    prefix = program.prefix;
+    extension = program.extension;
+  }
+
+  if (!state && !prefix && !findingType && !materialOnly && minAmount === undefined && auditYear === undefined) {
+    return {
+      found: false,
+      reason: 'no_filter',
+      hint: 'Pass at least one filter: state ("TX"), cfda ("93.224"), finding_type, material_weakness_only, min_amount, or audit_year — a fully unfiltered screen is not a useful answer.',
+    } satisfies NotFound;
+  }
+
+  const rows = await sbRpc(cfg, 'fac_cross_table_screen', {
+    state_in: state ? state.toUpperCase() : null,
+    cfda_prefix_in: prefix ?? null,
+    cfda_extension_in: extension ?? null,
+    finding_type_in: findingType ?? null,
+    material_weakness_only: materialOnly,
+    min_amount_in: minAmount ?? null,
+    audit_year_in: auditYear !== undefined ? Math.trunc(auditYear) : null,
+    lim: limit,
+    off: offset,
+  });
+
+  if (rows.length === 0) {
+    return {
+      found: false,
+      reason: 'no_matches',
+      hint: 'No (audit, award, finding) combination matched every filter together. Drop one filter — state and CFDA both being narrow, plus material_weakness_only, is a combination few audits satisfy at once.',
+      filters: { state: state?.toUpperCase(), cfda: prefix ? (extension ? `${prefix}.${extension}` : prefix) : undefined, finding_type: findingType, material_weakness_only: materialOnly || undefined, min_amount: minAmount, audit_year: auditYear },
+    } satisfies NotFound & { filters: Record<string, unknown> };
+  }
+
+  return {
+    found: true,
+    filters: { state: state?.toUpperCase(), cfda: prefix ? (extension ? `${prefix}.${extension}` : prefix) : undefined, finding_type: findingType, material_weakness_only: materialOnly || undefined, min_amount: minAmount, audit_year: auditYear },
+    count: rows.length,
+    truncated: rows.length === limit,
+    ranked_by: 'amount_expended.desc',
+    results: rows.map((r) => ({
+      report_id: r.report_id,
+      summary_url: summaryUrl(r.report_id as string | undefined),
+      auditee_name: r.auditee_name,
+      auditee_state: r.auditee_state,
+      audit_year: num(r.audit_year) ?? r.audit_year,
+      total_amount_expended: num(r.total_amount_expended),
+      award_reference: r.award_reference,
+      assistance_listing: assistanceListing(r as AwardRow),
+      federal_program_name: r.federal_program_name,
+      amount_expended: num(r.amount_expended),
+      reference_number: r.reference_number,
+      type_requirement: r.type_requirement,
+      is_material_weakness: r.is_material_weakness,
+      is_significant_deficiency: r.is_significant_deficiency,
+    })),
+    source: 'Federal Audit Clearinghouse, joined across /general + /federal_awards + /findings — not expressible against the live FAC API in one call',
+  };
+}
+
+/* -------------------------------------------------------------- dispatch */
+
+async function callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
+  const url = (args._supabaseUrl as string | undefined)?.trim();
+  const key = (args._supabaseKey as string | undefined)?.trim();
+  if (!url || !key) {
+    throw new Error(
+      'fac is not configured on this deployment — an operator must enable its data credentials. This is a setup problem, not your arguments.',
+    );
+  }
+  const cfg: DbConfig = { url, key };
+
+  const ignored = unrecognizedArgs(name, args);
+  const asOf = await dataAsOf(cfg);
+  const result = await dispatch(name, cfg, args);
+  const withFreshness =
+    result && typeof result === 'object' && !Array.isArray(result) ? withDataAsOf(result as Record<string, unknown>, asOf) : result;
+  return withArgWarning(name, withFreshness, ignored);
+}
+
+async function dispatch(name: string, cfg: DbConfig, args: Record<string, unknown>): Promise<unknown> {
+  switch (name) {
+    case 'fac_search_audits':
+      return searchAudits(cfg, args);
+    case 'fac_get_audit':
+      return getAudit(cfg, args);
+    case 'fac_audit_findings':
+      return auditFindings(cfg, args);
+    case 'fac_federal_awards_by_program':
+      return awardsByProgram(cfg, args);
+    case 'fac_recipient_audit_history':
+      return recipientHistory(cfg, args);
+    case 'fac_findings_search':
+      return findingsSearch(cfg, args);
+    case 'fac_cross_table_screen':
+      return crossTableScreen(cfg, args);
+    default:
+      throw new Error(`Unknown tool: ${name}`);
+  }
 }
 
 export default { tools, callTool, meter: { credits: 1 } } satisfies McpToolExport;
