@@ -1026,6 +1026,8 @@ function accentTolerant(place: string): string | undefined {
 interface NameMatch {
   apply: (params: URLSearchParams) => void;
   note?: string;
+  /** Present only on a token-fallback match (fleet #3193) — the words it required. */
+  tokens?: string[];
 }
 
 function orIlike(patterns: string[]): (params: URLSearchParams) => void {
@@ -1036,31 +1038,129 @@ function orIlike(patterns: string[]): (params: URLSearchParams) => void {
   };
 }
 
+const NAME_STOPWORDS = new Set([
+  'the', 'of', 'and', 'for', 'at', 'in', 'on', 'a', 'an',
+  'inc', 'incorporated', 'llc', 'corp', 'corporation', 'co', 'company', 'ltd', 'limited',
+]);
+
+export function nameTokens(raw: string): string[] {
+  const words = safePattern(raw)
+    .split(/\s+/)
+    .map((w) => w.replace(/[^a-z0-9]/gi, ''))
+    .filter((w) => w.length > 1 && !NAME_STOPWORDS.has(w.toLowerCase()));
+  return [...new Set(words)];
+}
+
+/**
+ * Common-name -> legal-name fallback (fleet #3193). FAC files the SAME
+ * recipient under different legal names in different filing years —
+ * Stanford's FYE 2025-08-31 audit is filed as "Board of Trustees of the
+ * Leland Stanford Junior University", every other year as plain "Stanford
+ * University" or "STANFORD UNIVERSITY". An exact-phrase ilike alone never
+ * matches that row ("Stanford Junior University" is not the substring
+ * "Stanford University").
+ *
+ * The fallback is combined with the exact phrase in ONE query via `or=`,
+ * not tried only when the exact phrase finds nothing. A retry-on-empty would
+ * have missed this exact shape: asking for "Stanford University" with no
+ * year ALREADY finds the 2024/2021 filings (they use that literal name), so
+ * it is never empty — it is a partial answer wearing the shape of a complete
+ * one. That is the same failure the Puerto Rico municipality dual-language
+ * matching below exists to avoid, and the same fix: put every spelling in
+ * the primary query so a match that already finds *some* rows still finds
+ * the rest.
+ */
 function nameMatch(rawName: string): NameMatch {
   const name = safePattern(rawName);
   const muni = MUNI_RE.exec(name);
-  if (!muni) return { apply: orIlike([name]) };
+  if (muni) {
+    const place = safePattern(muni[1]);
+    if (place) {
+      const places = [place];
+      const loose = accentTolerant(place);
+      if (loose) places.push(loose);
+      const patterns = places.flatMap((pl) => [`Municipality of ${pl}`, `Municipio de ${pl}`]);
+      return {
+        apply: orIlike(patterns),
+        note:
+          `Searched every spelling FAC actually files municipalities under — "Municipality of ${place}" and "Municipio de ${place}"` +
+          (loose ? ', each also matched accent-blind so the Spanish-accented rows ("MUNICIPALITY OF AÑASCO") come back too' : '') +
+          '. FAC uses either language depending on the submission year, so matching only the name you passed would have returned some of the audits and hidden the rest.',
+      };
+    }
+  }
 
-  const place = safePattern(muni[1]);
-  if (!place) return { apply: orIlike([name]) };
-
-  const places = [place];
-  const loose = accentTolerant(place);
-  if (loose) places.push(loose);
-
-  const patterns = places.flatMap((pl) => [`Municipality of ${pl}`, `Municipio de ${pl}`]);
+  const tokens = nameTokens(name);
+  if (tokens.length < 2) return { apply: orIlike([name]) };
 
   return {
-    apply: orIlike(patterns),
+    apply: (params) => {
+      const exactPred = `auditee_name.ilike.*${name}*`;
+      const tokenPred = `and(${tokens.map((t) => `auditee_name.ilike.*${t}*`).join(',')})`;
+      params.set('or', `(${exactPred},${tokenPred})`);
+    },
+    tokens,
     note:
-      `Searched every spelling FAC actually files municipalities under — "Municipality of ${place}" and "Municipio de ${place}"` +
-      (loose ? ', each also matched accent-blind so the Spanish-accented rows ("MUNICIPALITY OF AÑASCO") come back too' : '') +
-      '. FAC uses either language depending on the submission year, so matching only the name you passed would have returned some of the audits and hidden the rest.',
+      `Matched the exact phrase "${name}", or any audit whose filed name contains every one of these words in any order: ${tokens.join(', ')}. ` +
+      'FAC sometimes files the same recipient under a different legal name in a different filing year (e.g. "Board of Trustees of the Leland Stanford Junior University" for "Stanford University") — the exact phrase alone would have found some years and silently hidden that one.',
   };
 }
 
 const MUNI_HINT =
   'For Puerto Rico municipalities, FAC files under the English name ("MUNICIPALITY OF BAYAMON") about as often as the Spanish one ("MUNICIPIO DE MANATI"), and spells places with their accents ("MUNICIPALITY OF AÑASCO"). This tool already searches both languages — if it still missed, try the bare place name on its own with state="PR".';
+
+function nameKey(s: string): string {
+  return s
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
+/** Grades one candidate name against the query, for ranking/disclosure once a
+ *  token-fallback match (or any broad match) returns more than one row:
+ *  exact — the filed name IS the query (case/punctuation-insensitive)
+ *  contains — the query appears as a contiguous phrase inside the filed name
+ *  token — only matched because every word is present, not the phrase */
+export function gradeNameMatch(query: string, candidate: unknown): 'exact' | 'contains' | 'token' {
+  const q = nameKey(query);
+  const c = nameKey(typeof candidate === 'string' ? candidate : '');
+  if (!q || !c) return 'token';
+  if (q === c) return 'exact';
+  return ` ${c} `.includes(` ${q} `) ? 'contains' : 'token';
+}
+const NAME_MATCH_ORDER = { exact: 0, contains: 1, token: 2 } as const;
+
+/** Ranks shaped rows (anything carrying auditee_name) exact-first, contains-next,
+ *  token-last, and tags each with its grade — so a broadened match discloses
+ *  which rows are the recipient asked for and which are merely plausible. */
+function rankByNameMatch<T extends { auditee_name?: unknown }>(
+  query: string,
+  rows: T[],
+): (T & { auditee_name_match: 'exact' | 'contains' | 'token' })[] {
+  return rows
+    .map((row, i) => ({ row: { ...row, auditee_name_match: gradeNameMatch(query, row.auditee_name) }, i }))
+    .sort((a, b) => NAME_MATCH_ORDER[a.row.auditee_name_match] - NAME_MATCH_ORDER[b.row.auditee_name_match] || a.i - b.i)
+    .map(({ row }) => row);
+}
+
+/** Pre-2022 records migrated from the old Census-run FAC carry the literal
+ *  string "GSA_MIGRATION" in auditee_uei as a placeholder, not a real UEI
+ *  (scripts/fac-normalize.py nulls this sentinel out of narrative-text columns
+ *  but not identity columns, since FAC's own extract carries it there too).
+ *  Grouping by UEI without excluding it splits one recipient's own migrated-era
+ *  audits into a second, fake "entity" sharing every other filer's sentinel —
+ *  exactly the cross-entity confusion fix (2) exists to prevent. Prefer EIN
+ *  (always a real tax id, stable across the migration boundary) over UEI. */
+const UEI_SENTINEL = 'GSA_MIGRATION';
+export function entityKey(row: { auditee_ein?: unknown; auditee_uei?: unknown; auditee_name?: unknown }): string {
+  const ein = row.auditee_ein;
+  if (typeof ein === 'string' && ein.trim()) return `ein:${ein.trim()}`;
+  const uei = row.auditee_uei;
+  if (typeof uei === 'string' && uei.trim() && uei.trim() !== UEI_SENTINEL) return `uei:${uei.trim()}`;
+  const name = row.auditee_name;
+  if (typeof name === 'string' && name.trim()) return `name:${nameKey(name)}`;
+  return 'unknown';
+}
 
 /* --------------------------------------------- unrecognized-argument guard */
 
@@ -1335,7 +1435,7 @@ async function searchAudits(cfg: DbConfig, args: Record<string, unknown>) {
   const orderBy = orderByRaw && ORDER_COLUMNS.has(orderByRaw) ? orderByRaw : 'total_amount_expended';
   const dir = optBool(args, 'ascending', false) ? 'asc' : 'desc';
 
-  const baseParams = (): URLSearchParams => {
+  const baseParams = (opts: { includeAuditYear?: boolean } = {}): URLSearchParams => {
     const params = new URLSearchParams({
       select: GENERAL_SELECT,
       order: `${orderBy}.${dir}`,
@@ -1345,19 +1445,24 @@ async function searchAudits(cfg: DbConfig, args: Record<string, unknown>) {
     if (uei) params.set('auditee_uei', `eq.${uei.toUpperCase()}`);
     if (ein) params.set('auditee_ein', `eq.${ein.replace(/\D/g, '')}`);
     if (state) params.set('auditee_state', `eq.${state.toUpperCase()}`);
-    if (auditYear !== undefined) params.set('audit_year', `eq.${Math.trunc(auditYear)}`);
-    else if (auditYearMin !== undefined) params.set('audit_year', `gte.${Math.trunc(auditYearMin)}`);
+    if (opts.includeAuditYear !== false) {
+      if (auditYear !== undefined) params.set('audit_year', `eq.${Math.trunc(auditYear)}`);
+      else if (auditYearMin !== undefined) params.set('audit_year', `gte.${Math.trunc(auditYearMin)}`);
+    }
     if (minExpended !== undefined) params.set('total_amount_expended', `gte.${Math.trunc(minExpended)}`);
     return params;
   };
 
   const match = name ? nameMatch(name) : undefined;
-  const matchNote = match?.note;
 
-  const params = baseParams();
-  match?.apply(params);
-  applyZipFilter(params, zip5);
-  const rows = await sbRows(cfg, '/fac_general', params);
+  const buildParams = (opts?: { includeAuditYear?: boolean }): URLSearchParams => {
+    const params = baseParams(opts);
+    match?.apply(params);
+    applyZipFilter(params, zip5);
+    return params;
+  };
+
+  const rows = await sbRows(cfg, '/fac_general', buildParams());
 
   if (rows.length === 0) {
     if (zip5) {
@@ -1376,12 +1481,56 @@ async function searchAudits(cfg: DbConfig, args: Record<string, unknown>) {
         };
       }
     }
+
+    // The recipient may be on file under this name but not in the year asked
+    // for — same disclosure shape as the zip fallback above (fleet #3193). A
+    // bare "no match" here is indistinguishable from "never filed that year",
+    // which is exactly the silent-wrong-answer shape the Stanford FY2025 bug
+    // took: the caller cannot tell "not filed" from "filed under a name/year
+    // this query didn't try" unless the years actually on file are named.
+    if (name && (auditYear !== undefined || auditYearMin !== undefined)) {
+      const probeNoYear = buildParams({ includeAuditYear: false });
+      probeNoYear.set('limit', '25');
+      const withoutYear = await sbRows(cfg, '/fac_general', probeNoYear);
+      if (withoutYear.length > 0) {
+        const years = [...new Set(
+          withoutYear.map((r) => num((r as GeneralRow).audit_year)).filter((y): y is number => y !== undefined),
+        )].sort((a, b) => b - a);
+        return {
+          found: false,
+          reason: 'audit_year_no_match',
+          hint: `"${name}" matched ${withoutYear.length} audit${withoutYear.length === 1 ? '' : 's'}, but none for audit_year ${auditYear ?? `>= ${auditYearMin}`}. FAC holds audit_year ${years.join(', ')} for this recipient — re-run with one of those, or drop audit_year.`,
+          audit_years_on_file: years,
+          matches_other_years: withoutYear.map(shapeGeneral),
+        };
+      }
+    }
+
     return {
       found: false,
       reason: 'no_audits_match',
-      hint: `No single audit matched. Try a shorter auditee_name fragment${name ? ` than "${name}"` : ''}, drop the audit_year, or search by uei. Entities under the ~$750k federal-spend threshold never file.${match?.note ? ` ${MUNI_HINT}` : ''}`,
-    } satisfies NotFound;
+      hint: `No single audit matched. Try a shorter auditee_name fragment${name ? ` than "${name}"` : ''}, drop the audit_year, or search by uei. Entities under the ~$750k federal-spend threshold never file.${match?.note && !match.tokens ? ` ${MUNI_HINT}` : ''}`,
+      filters_tried: {
+        auditee_name: name,
+        uei,
+        ein,
+        state,
+        zip: zip5,
+        audit_year: auditYear,
+        audit_year_min: auditYearMin,
+        min_total_expended: minExpended,
+      },
+      name_match_attempted: name
+        ? {
+            exact_phrase: name,
+            tokens_also_tried: match?.tokens,
+          }
+        : undefined,
+    };
   }
+
+  const shaped = rows.map(shapeGeneral);
+  const audits = name ? rankByNameMatch(name, shaped) : shaped;
 
   return {
     found: true,
@@ -1395,10 +1544,10 @@ async function searchAudits(cfg: DbConfig, args: Record<string, unknown>) {
       audit_year_min: auditYearMin,
       min_total_expended: minExpended,
     },
-    name_match: matchNote,
+    name_match: match?.note,
     count: rows.length,
     order: `${orderBy}.${dir}`,
-    audits: rows.map(shapeGeneral),
+    audits,
     source: 'Federal Audit Clearinghouse /general',
   };
 }
@@ -1516,26 +1665,50 @@ async function auditFindings(cfg: DbConfig, args: Record<string, unknown>) {
       scope.audit_year = Math.trunc(auditYear);
     }
   } else if (name) {
+    // Combined exact + every-word-present match (fleet #3193), one query —
+    // so "Stanford University" finds the one filing year ("Board of
+    // Trustees of the Leland Stanford Junior University") an exact phrase
+    // alone cannot, even though the exact phrase already matches other years.
     const match = nameMatch(name);
-    const buildGp = (m: NameMatch): URLSearchParams => {
-      const gp = new URLSearchParams({ select: GENERAL_SELECT, order: 'audit_year.desc', limit: '25' });
-      m.apply(gp);
-      if (auditYear !== undefined) gp.set('audit_year', `eq.${Math.trunc(auditYear)}`);
-      return gp;
-    };
-    const generalRows = await sbRows(cfg, '/fac_general', buildGp(match));
+    const gp = new URLSearchParams({ select: GENERAL_SELECT, order: 'audit_year.desc', limit: '25' });
+    match.apply(gp);
+    if (auditYear !== undefined) gp.set('audit_year', `eq.${Math.trunc(auditYear)}`);
+    const generalRows = await sbRows(cfg, '/fac_general', gp);
     if (generalRows.length === 0) {
       return {
         found: false,
         reason: 'no_audits_match',
-        hint: `No audit matched "${name}", so there are no findings to pull. Try a shorter name fragment or confirm the recipient with fac_search_audits.${match.note ? ` ${MUNI_HINT}` : ''}`,
-      } satisfies NotFound;
+        hint: `No audit matched "${name}", so there are no findings to pull. Try a shorter name fragment or confirm the recipient with fac_search_audits.${match.note && !match.tokens ? ` ${MUNI_HINT}` : ''}`,
+        name_match_attempted: { exact_phrase: name, tokens_also_tried: match.tokens },
+      };
     }
-    context = generalRows.map(shapeGeneral);
+
+    // Fix (2), fleet #3193: findings must never be reported against a
+    // different audit than the one asked about. A broadened (token) name
+    // match can pull in more than one real-world recipient that merely
+    // shares every word — never pool their findings into one unlabeled
+    // summary. Name the mismatch instead of guessing whose data this is.
+    // entityKey ignores the "GSA_MIGRATION" UEI-migration sentinel, so one
+    // recipient's own pre-2022 rows are never miscounted as a second entity.
+    const distinctEntities = [...new Set(generalRows.map((r) => entityKey(r as GeneralRow)))];
+    if (distinctEntities.length > 1) {
+      return {
+        found: false,
+        reason: 'ambiguous_name_match',
+        hint: `"${name}" matched ${distinctEntities.length} different legal entities, not one recipient — reporting findings would pool unrelated audits under one summary. Pass uei or report_id to pin one, or audit_year to narrow it.`,
+        candidates: rankByNameMatch(name, generalRows.map(shapeGeneral)),
+      };
+    }
+
+    context = rankByNameMatch(name, generalRows.map(shapeGeneral));
     reportIds = generalRows.map((r) => String((r as GeneralRow).report_id ?? '')).filter(Boolean);
     params.set('report_id', reportIds.length === 1 ? `eq.${reportIds[0]}` : inList(reportIds));
     scope.auditee_name = name;
     scope.audits_matched = reportIds.length;
+    scope.audits_searched_report_ids = reportIds;
+    scope.matched_audit_years = [...new Set(
+      generalRows.map((r) => num((r as GeneralRow).audit_year)).filter((y): y is number => y !== undefined),
+    )].sort((a, b) => b - a);
   } else {
     return {
       found: false,
@@ -1759,6 +1932,10 @@ async function recipientHistory(cfg: DbConfig, args: Record<string, unknown>) {
     } satisfies NotFound;
   }
 
+  // Name filter only applies when resolving by name alone — a caller who
+  // already gave uei/ein is identified, so no name filter is applied.
+  // nameMatch combines the exact phrase with the every-word-present
+  // fallback in one query (fleet #3193).
   const match = !uei && !ein && name ? nameMatch(name) : undefined;
   const buildParams = (m?: NameMatch): URLSearchParams => {
     const params = new URLSearchParams({
@@ -1774,19 +1951,31 @@ async function recipientHistory(cfg: DbConfig, args: Record<string, unknown>) {
   };
 
   const rows = await sbRows(cfg, '/fac_general', buildParams(match));
+
   if (rows.length === 0) {
     return {
       found: false,
       reason: 'no_audit_history',
-      hint: `No single audits on file for that recipient${name ? ` matching "${name}"` : ''}. Try a shorter name fragment, drop the state filter, or confirm the UEI with fac_search_audits.${match?.note ? ` ${MUNI_HINT}` : ''}`,
-    } satisfies NotFound;
+      hint: `No single audits on file for that recipient${name ? ` matching "${name}"` : ''}. Try a shorter name fragment, drop the state filter, or confirm the UEI with fac_search_audits.${match?.note && !match.tokens ? ` ${MUNI_HINT}` : ''}`,
+      name_match_attempted: name ? { exact_phrase: name, tokens_also_tried: match?.tokens } : undefined,
+    };
   }
 
-  const shaped = rows.map(shapeGeneral);
+  const shapedRaw = rows.map(shapeGeneral);
+  const shaped = name ? rankByNameMatch(name, shapedRaw) : shapedRaw;
 
+  // Group by entity, not by name string — entityKey prefers EIN (stable
+  // across the 2022 FAC migration) and ignores the literal "GSA_MIGRATION"
+  // UEI placeholder, so one recipient's pre-2022 rows are never miscounted
+  // as a second, fake "entity" sharing every other filer's sentinel. This
+  // guards the exact scenario fix (1) widens exposure to: Stanford's own
+  // 2019-2021 rows carry auditee_uei="GSA_MIGRATION", and a naive
+  // uei-first grouping key would have reported a false "2 entities matched"
+  // for a single university the moment token matching started returning its
+  // full multi-year history.
   const entities = new Map<string, { auditee_uei?: string; auditee_name?: string; auditee_state?: string; audits: number }>();
   for (const r of shaped) {
-    const key = String(r.auditee_uei ?? r.auditee_ein ?? r.auditee_name ?? 'unknown');
+    const key = entityKey(r);
     const e = entities.get(key);
     if (e) e.audits += 1;
     else
@@ -1827,6 +2016,7 @@ async function recipientHistory(cfg: DbConfig, args: Record<string, unknown>) {
     resolved_to: [...entities.values()],
     matched_entity_count: entities.size,
     ambiguous: entities.size > 1 ? 'Several legal entities matched that name — pass uei to pin one.' : undefined,
+    name_match: match?.note,
     years_returned: history.length,
     history,
     trend,
