@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-fac",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Federal Audit Clearinghouse (FAC) MCP — US single-audit data, served from a served from a Pipeworx-maintained copy of its own bulk data (fleet #2504). hosting-claims-ok: internal architecture note for maintainers, not caller-visible.",
   "type": "module",
   "main": "src/index.ts",
@@ -26,7 +26,7 @@
     "@cloudflare/workers-types": "^4.20260405.1"
   },
   "pipeworx": {
-    "sourceHash": "v1-004b94f801b8eee736ccb3fb9e3dbb51a059d2a7cc515cdd45da40cf7b62e32b",
-    "sourceCommit": "712a5e0171ea24483214329d0cd7efdfd9b80352"
+    "sourceHash": "v1-989715ff66a41f7327b2d485e4d2b47c0a1f543de5592304dd93232d52dec22a",
+    "sourceCommit": "722087a9bda73f85942e8f6bbfd598544cb0d490"
   }
 }
