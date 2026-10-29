@@ -3,7 +3,7 @@
   "name": "io.github.pipeworx-io/fac",
   "title": "Fac",
   "description": "Federal Audit Clearinghouse (FAC) MCP — US single-audit data, served from a served from a…",
-  "version": "0.1.6",
+  "version": "0.2.0",
   "websiteUrl": "https://pipeworx.io/packs/fac",
   "repository": {
     "url": "https://github.com/pipeworx-io/mcp-fac",

@@ -1,12 +1,20 @@
 {
   "name": "@pipeworx/mcp-fac",
-  "version": "0.1.6",
+  "version": "0.2.0",
   "description": "Federal Audit Clearinghouse (FAC) MCP — US single-audit data, served from a served from a Pipeworx-maintained copy of its own bulk data (fleet #2504). hosting-claims-ok: internal architecture note for maintainers, not caller-visible.",
   "type": "module",
-  "main": "src/index.ts",
-  "types": "src/index.ts",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./tools.json": "./tools.json",
+    "./package.json": "./package.json"
+  },
   "bin": {
     "mcp-fac": "bin/cli.js"
+  },
+  "files": ["bin/", "lib/", "tools.json", "server.json"],
+  "engines": {
+    "node": ">=18"
   },
   "keywords": ["mcp", "mcp-server", "model-context-protocol", "pipeworx", "fac"],
   "license": "MIT",
@@ -14,19 +22,12 @@
     "type": "git",
     "url": "git+https://github.com/pipeworx-io/mcp-fac.git"
   },
-  "scripts": {
-    "typecheck": "tsc --noEmit"
-  },
-  "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.30.0",
-    "tsx": "^4.19.0"
-  },
-  "devDependencies": {
-    "typescript": "^5.9.3",
-    "@cloudflare/workers-types": "^4.20260405.1"
-  },
+  "mcpName": "io.github.pipeworx-io/fac",
   "pipeworx": {
-    "sourceHash": "v1-989715ff66a41f7327b2d485e4d2b47c0a1f543de5592304dd93232d52dec22a",
-    "sourceCommit": "722087a9bda73f85942e8f6bbfd598544cb0d490"
+    "mode": "gateway",
+    "slug": "fac",
+    "gatewaySlug": "fac",
+    "sourceHash": "v1-522e3258a7416836163c0058d8c00c1e53261309748e7505b7bb09c0493c5058",
+    "sourceCommit": "bb047243cf27f32453103de186b8e6a8b6a1ce79"
   }
 }
